@@ -16,6 +16,7 @@ use std::sync::{Arc, Weak, mpsc};
 use std::time::{Duration, Instant};
 use std::{fmt, thread};
 
+use rustls_pki_types::CertificateDer;
 use ureq::unversioned::transport::{
     Buffers, ConnectProxyConnector, ConnectionDetails, Connector, Either, LazyBuffers, NextTimeout, RustlsConnector, ShutdownHandle,
     Transport,
@@ -47,6 +48,18 @@ pub(crate) fn connector() -> impl Connector<(), Out = impl Transport> {
 /// [`connector`], with reads and writes giving up after `stall` of silence.
 pub(crate) fn connector_with(stall: Duration) -> impl Connector<(), Out = impl Transport> {
     ().chain(ConnectProxyConnector::default()).chain(HappyConnector { stall }).chain(RustlsConnector::default())
+}
+
+/// The TLS settings every agent needs: `roots` (normally
+/// [`crate::roots::trusted`]) and ring. ureq is built without its bundled
+/// roots or a default provider, so an agent without these fails its first
+/// https call.
+pub fn tls_config(roots: &[CertificateDer<'static>]) -> ureq::tls::TlsConfig {
+    let certs = roots.iter().map(|c| ureq::tls::Certificate::from_der(c.as_ref()).to_owned()).collect();
+    ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::Specific(Arc::new(certs)))
+        .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .build()
 }
 
 /// The addresses in the order to try them: the family the resolver put
@@ -390,5 +403,91 @@ mod tests {
         let closed = TcpListener::bind("[::1]:0").ok().map(|l| l.local_addr().unwrap()).unwrap_or(addr("[::1]:9"));
         let stream = race(&[closed, open], ATTEMPT_DELAY, Some(Duration::from_secs(5)), Arc::new(|a, limit| connect_one(a, limit, true))).unwrap();
         assert_eq!(stream.peer_addr().unwrap(), open);
+    }
+
+    use rcgen::{BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair};
+    use rustls_pki_types::PrivateKeyDer;
+
+    /// A test CA named `name`: its root certificate, and the issuer that signs with it.
+    /// Two CAs need different names, or webpki matches a leaf to the wrong root and fails its signature.
+    fn test_ca(name: &str) -> (CertificateDer<'static>, Issuer<'static, KeyPair>) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, name);
+        let cert = params.clone().self_signed(&key).unwrap();
+        (cert.der().clone(), Issuer::new(params, key))
+    }
+
+    /// Serves one request over TLS on a loopback port, with a `localhost`
+    /// certificate signed by `ca`. It answers 200 with body `ok`. Returns the port.
+    fn serve_https_once(ca: &Issuer<'static, KeyPair>) -> u16 {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = params.signed_by(&key, ca).unwrap();
+        let key = PrivateKeyDer::Pkcs8(key.serialize_der().into());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf.der().clone()], key)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            // A failed handshake ends this read early; the test then sees the client's error.
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && matches!(tls.read(&mut byte), Ok(1)) {
+                head.push(byte[0]);
+            }
+            let _ = tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+            let _ = tls.flush();
+        });
+        port
+    }
+
+    #[test]
+    fn trusts_a_server_whose_ca_is_in_the_given_roots() {
+        let (ca_der, ca) = test_ca("kiri test server CA");
+        let port = serve_https_once(&ca);
+        let agent = ureq::Agent::with_parts(
+            ureq::Agent::config_builder().tls_config(tls_config(&[ca_der])).http_status_as_error(false).build(),
+            connector(),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        );
+
+        let resp = agent.get(&format!("https://localhost:{port}/")).call();
+
+        assert_eq!(resp.expect("https call").status().as_u16(), 200);
+    }
+
+    #[test]
+    fn refuses_a_server_whose_ca_is_not_in_the_given_roots() {
+        let (_, server_ca) = test_ca("kiri test server CA");
+        let (other_ca_der, _) = test_ca("kiri test other CA");
+        let port = serve_https_once(&server_ca);
+        let agent = ureq::Agent::with_parts(
+            ureq::Agent::config_builder().tls_config(tls_config(&[other_ca_der])).http_status_as_error(false).build(),
+            connector(),
+            ureq::unversioned::resolver::DefaultResolver::default(),
+        );
+
+        let err = agent.get(&format!("https://localhost:{port}/")).call().unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("UnknownIssuer"), "{text}");
+    }
+
+    #[test]
+    fn gives_every_agent_specific_roots() {
+        let got = tls_config(&[]);
+
+        assert!(matches!(got.root_certs(), ureq::tls::RootCerts::Specific(_)));
     }
 }

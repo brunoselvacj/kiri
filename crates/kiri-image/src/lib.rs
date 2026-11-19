@@ -9,6 +9,8 @@ mod connect;
 pub mod jsonfile;
 pub mod reference;
 pub mod registry;
+pub mod roots;
+pub use connect::tls_config;
 pub mod store;
 pub mod tags;
 

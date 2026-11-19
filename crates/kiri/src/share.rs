@@ -35,6 +35,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use kiri_share_proto::{self as proto, Msg};
+use rustls::pki_types::CertificateDer;
 use rustls::pki_types::ServerName;
 use rustls::pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
@@ -328,15 +329,28 @@ fn server(cfg: &Config) -> Server {
     Server { host, port, dial }
 }
 
-fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
+/// The roots Share trusts: `trusted` (the system's store and the bundled
+/// set), then `share_ca`, the `KIRI_SHARE_CA` file's certificates, for an
+/// edge signed by a private CA. A bad entry there is an error: the file was
+/// asked for by name.
+fn root_store(trusted: &[CertificateDer<'static>], share_ca: &[CertificateDer<'static>]) -> io::Result<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots.add_parsable_certificates(trusted.iter().cloned());
+    for c in share_ca {
+        roots.add(c.clone()).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+    }
+    Ok(roots)
+}
+
+fn tls_config(alpn: &[u8]) -> io::Result<Arc<rustls::ClientConfig>> {
+    let mut share_ca = Vec::new();
     if let Some(ca) = std::env::var_os("KIRI_SHARE_CA") {
         let certs = rustls::pki_types::CertificateDer::pem_file_iter(&ca).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
         for c in certs {
-            roots.add(c.map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?).map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?;
+            share_ca.push(c.map_err(|e| io::Error::other(format!("KIRI_SHARE_CA: {e}")))?);
         }
     }
+    let roots = root_store(crate::roots::trusted(), &share_ca)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut c = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -2311,5 +2325,33 @@ mod tests {
         assert_eq!(device_code_deadline(now, 900), now + Duration::from_secs(900));
         // A hostile expires_in neither panics nor waits more than an hour.
         assert_eq!(device_code_deadline(now, u64::MAX), now + Duration::from_secs(MAX_DEVICE_CODE_SECS));
+    }
+
+    #[test]
+    fn trusts_the_given_roots_when_kiri_share_ca_is_unset() {
+        let certs = webpki_root_certs::TLS_SERVER_ROOT_CERTS;
+
+        let roots = super::root_store(&certs[0..2], &[]).unwrap();
+
+        assert_eq!(roots.len(), 2);
+    }
+
+    #[test]
+    fn adds_the_kiri_share_ca_certificates_to_the_given_roots() {
+        let certs = webpki_root_certs::TLS_SERVER_ROOT_CERTS;
+
+        let roots = super::root_store(&certs[0..2], &certs[2..3]).unwrap();
+
+        assert_eq!(roots.len(), 3);
+    }
+
+    #[test]
+    fn refuses_a_kiri_share_ca_entry_that_is_not_a_certificate() {
+        let certs = webpki_root_certs::TLS_SERVER_ROOT_CERTS;
+        let bad = vec![rustls::pki_types::CertificateDer::from(vec![1u8, 2, 3])];
+
+        let err = super::root_store(&certs[0..1], &bad).unwrap_err();
+
+        assert!(err.to_string().contains("KIRI_SHARE_CA"), "{err}");
     }
 }

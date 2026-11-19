@@ -64,6 +64,7 @@ pub fn newer(candidate: &str, current: &str) -> bool {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .tls_config(kiri_image::tls_config(kiri_image::roots::trusted()))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
@@ -427,6 +428,11 @@ fn bundle_version(plist: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{Release, bundle_version, has_cpu, newer, runs_here};
+
+    #[test]
+    fn the_update_agent_trusts_the_merged_roots() {
+        assert!(matches!(super::agent().config().tls_config().root_certs(), ureq::tls::RootCerts::Specific(_)));
+    }
 
     #[test]
     fn compares_versions() {

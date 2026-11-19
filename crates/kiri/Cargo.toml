@@ -15,11 +15,9 @@ serde_json = "1"
 sha2 = "0.11"
 # gzip uploads to PUT /containers/{id}/archive (DDEV sends them).
 flate2 = "1"
-ureq = { version = "3", default-features = false, features = ["rustls"] }
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
 # HTTPS for container names: the same rustls and ring ureq already brings in.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# Roots for `kiri share`'s connection to the edge.
-webpki-roots = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 # The `name` filter is a regular expression in Docker (k3d sends `^[/]?name$`).
 # regex-lite: RE2 syntax like Go's regexp, without the Unicode tables' size.
@@ -52,6 +50,8 @@ javascriptcore-rs = { version = "1", optional = true }
 # The tests read back the tar archives the managed builder writes.
 [dev-dependencies]
 tar = "0.4"
+# Real certificates for share.rs's root-store tests.
+webpki-root-certs = "1"
 
 [features]
 window = ["dep:gtk", "dep:webkit2gtk", "dep:javascriptcore-rs"]

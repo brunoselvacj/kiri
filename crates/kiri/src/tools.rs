@@ -36,6 +36,7 @@ pub fn lite() -> bool {
 pub(crate) fn agent() -> ureq::Agent {
     let mut cfg = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(15)))
+        .tls_config(kiri_image::tls_config(kiri_image::roots::trusted()))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")));
     let e = crate::daemon::proxy::effective();
     if let Some(p) = e.https.or(e.http).and_then(|u| ureq::Proxy::new(&u).ok()) {
@@ -139,6 +140,11 @@ pub fn ensure(progress: &mut dyn FnMut(&str, usize, usize, u8)) -> io::Result<()
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_download_agent_trusts_the_merged_roots() {
+        assert!(matches!(super::agent().config().tls_config().root_certs(), ureq::tls::RootCerts::Specific(_)));
+    }
+
     #[test]
     fn refuses_a_wrong_checksum() {
         let dir = std::env::temp_dir().join(format!("kiri-tools-{}", std::process::id()));

@@ -270,6 +270,7 @@ fn shared_agent() -> ureq::Agent {
         // and one to its CDN; keep them all for the next pull.
         .max_idle_connections(32)
         .max_idle_connections_per_host(PARALLEL_LAYERS * 2)
+        .tls_config(crate::connect::tls_config(crate::roots::trusted()))
         .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")));
     if let Some(p) = proxy(chosen.clone()) {
         cfg = cfg.proxy(p);
@@ -1409,6 +1410,11 @@ mod tests {
 
     fn quit(host: &str) {
         let _ = std::net::TcpStream::connect(host).and_then(|mut c| c.write_all(b"QUIT\r\n\r\n"));
+    }
+
+    #[test]
+    fn the_shared_agent_trusts_the_merged_roots() {
+        assert!(matches!(shared_agent().config().tls_config().root_certs(), ureq::tls::RootCerts::Specific(_)));
     }
 
     fn test_client() -> Client {
